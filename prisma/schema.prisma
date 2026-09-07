@@ -21,12 +21,21 @@ enum PaymentStatus {
   REFUNDED
 }
 
+model Category {
+  id        Int       @id @default(autoincrement())
+  name      String    @unique
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  products  Product[]
+}
+
 model Product {
   id          Int       @id @default(autoincrement())
   name        String    @unique
   description String?
   price       Float
-  category    String?
+  categoryId  Int
+  categoryRef Category  @relation(fields: [categoryId], references: [id])
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   image       String?

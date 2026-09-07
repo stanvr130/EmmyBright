@@ -32,8 +32,8 @@ const createProductSchema = Joi.object({
     'number.positive': 'Price must be a positive numerical value.',
     'any.required': 'Price is a required field.'
   }),
-  category: Joi.string().trim().required().messages({
-    'string.empty': 'Category name cannot be empty.',
+  categoryId: Joi.number().integer().positive().required().messages({
+    'number.base': 'Category must be a valid category ID.',
     'any.required': 'Category is a required field.'
   }),
   image: Joi.string().trim().allow('', null).optional().messages({
@@ -57,7 +57,7 @@ const updateProductSchema = Joi.object({
   name: Joi.string().trim().min(2).optional(),
   description: Joi.string().trim().allow('', null).optional(),
   price: Joi.number().positive().optional(),
-  category: Joi.string().trim().optional(),
+  categoryId: Joi.number().integer().positive().optional(),
   image: Joi.string().trim().allow('', null).optional(),
   variants: Joi.array().items(
     Joi.object({
@@ -83,6 +83,9 @@ const parseFormDataFields = (req, res, next) => {
   if (typeof req.body.price === 'string' && req.body.price !== '') {
     req.body.price = parseFloat(req.body.price);
   }
+  if (typeof req.body.categoryId === 'string' && req.body.categoryId !== '') {
+    req.body.categoryId = parseInt(req.body.categoryId, 10);
+  }
   if (typeof req.body.variants === 'string') {
     try {
       req.body.variants = JSON.parse(req.body.variants);
@@ -105,12 +108,12 @@ const parseFormDataFields = (req, res, next) => {
  *     tags: [Products]
  *     responses:
  *       200:
- *         description: Array of all products with nested variants
+ *         description: Array of all products with nested variants and category
  */
 router.get('/', async (req, res, next) => {
   try {
     const products = await prisma.product.findMany({
-      include: { variants: true }
+      include: { variants: true, categoryRef: true }
     });
     return res.status(200).json(products);
   } catch (error) {
@@ -120,35 +123,32 @@ router.get('/', async (req, res, next) => {
 
 /**
  * @swagger
- * /api/products/category/{categoryName}:
+ * /api/products/category/{categoryId}:
  *   get:
- *     summary: Get products by category (Public)
+ *     summary: Get products by category ID (Public)
  *     tags: [Products]
  *     parameters:
  *       - in: path
- *         name: categoryName
+ *         name: categoryId
  *         required: true
  *         schema:
- *           type: string
- *         description: Category name (case-insensitive)
+ *           type: integer
  *     responses:
  *       200:
  *         description: Filtered product list with variants
+ *       400:
+ *         description: Invalid category ID
  */
-router.get('/category/:categoryName', async (req, res, next) => {
+router.get('/category/:categoryId', async (req, res, next) => {
   try {
-    const { categoryName } = req.params;
+    const idAsInt = parseInt(req.params.categoryId, 10);
+    if (isNaN(idAsInt)) {
+      return res.status(400).json({ error: 'Invalid category ID parameter provided.' });
+    }
 
     const filteredProducts = await prisma.product.findMany({
-      where: {
-        category: {
-          equals: categoryName,
-          mode: 'insensitive' 
-        }
-      },
-      include: {
-        variants: true 
-      }
+      where: { categoryId: idAsInt },
+      include: { variants: true, categoryRef: true }
     });
 
     return res.status(200).json(filteredProducts);
@@ -181,8 +181,8 @@ router.get('/category/:categoryName', async (req, res, next) => {
  *                 type: string
  *               price:
  *                 type: number
- *               category:
- *                 type: string
+ *               categoryId:
+ *                 type: integer
  *               variants:
  *                 type: string
  *                 description: JSON stringified array of variants
@@ -224,7 +224,7 @@ router.post(
                 name: item.name,
                 description: item.description || null,
                 price: parseFloat(item.price),
-                category: item.category,
+                categoryId: item.categoryId,
                 image: item.image || null,
                 variants: item.variants && item.variants.length > 0 ? {
                   create: item.variants.map(v => ({
@@ -235,7 +235,8 @@ router.post(
                 } : undefined
               },
               include: {
-                variants: true
+                variants: true,
+                categoryRef: true
               }
             })
           )
@@ -249,14 +250,14 @@ router.post(
         });
       }
 
-      const { name, description, price, category, image, variants } = value;
+      const { name, description, price, categoryId, image, variants } = value;
 
       const newProduct = await prisma.product.create({
         data: {
           name,
           description: description || null,
           price: parseFloat(price),
-          category,
+          categoryId,
           image: image || null,
           variants: variants && variants.length > 0 ? {
             create: variants.map(v => ({
@@ -267,12 +268,16 @@ router.post(
           } : undefined
         },
         include: {
-          variants: true 
+          variants: true,
+          categoryRef: true
         }
       });
 
       return res.status(201).json(newProduct);
     } catch (error) {
+      if (error.code === 'P2003') {
+        return res.status(400).json({ error: 'The specified category does not exist.' });
+      }
       next(error);
     }
   }
@@ -307,6 +312,8 @@ router.post(
  *                 type: string
  *               price:
  *                 type: number
+ *               categoryId:
+ *                 type: integer
  *               variants:
  *                 type: string
  *     responses:
@@ -327,7 +334,7 @@ router.put(
   async (req, res, next) => {
     try {
       const { id } = req.params;
-      const { name, description, price, category, image, variants } = req.body;
+      const { name, description, price, categoryId, image, variants } = req.body;
       const productIdAsInt = parseInt(id, 10);
 
       if (isNaN(productIdAsInt)) {
@@ -341,7 +348,7 @@ router.put(
             name: name !== undefined ? name : undefined,
             description: description !== undefined ? description : undefined,
             price: price !== undefined ? parseFloat(price) : undefined,
-            category: category !== undefined ? category : undefined,
+            categoryId: categoryId !== undefined ? categoryId : undefined,
             image: image !== undefined ? image : undefined,
           },
         });
@@ -372,7 +379,7 @@ router.put(
 
         return tx.product.findUniqueOrThrow({
           where: { id: productIdAsInt },
-          include: { variants: true }
+          include: { variants: true, categoryRef: true }
         });
       });
 
@@ -380,6 +387,9 @@ router.put(
     } catch (error) {
       if (error.code === 'P2025') {
         return res.status(404).json({ error: `Product target with ID ${req.params.id} does not exist.` });
+      }
+      if (error.code === 'P2003') {
+        return res.status(400).json({ error: 'The specified category does not exist.' });
       }
       next(error);
     }

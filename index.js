@@ -19,7 +19,8 @@ import productRoutes from './routes/productsRoutes.js';
 import authRoutes from './routes/authRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import orderRoutes from './routes/orderRoutes.js';
-import paymentRoutes from './routes/payment.js'; // 👈 Matches payment.js
+import paymentRoutes from './routes/payment.js'; 
+import categoryRoutes from './routes/categoryRoutes.js';
 import errorHandler from './middleware/errorMiddleware.js';
 
 // Setup ES Module equivalents for __dirname
@@ -96,7 +97,8 @@ app.use('/api/products', productRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/orders', orderRoutes);
-app.use('/api/payments', paymentRoutes); // 👈 Mounted payments endpoint
+app.use('/api/payments', paymentRoutes); 
+app.use('/api/categories', categoryRoutes);
 
 // 🚨 Global Error Handler Middleware
 app.use(errorHandler);
