@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "nodemon --ignore public-images/ index.js"
+    "dev": "nodemon --ignore public-images/ index.js",
+    "postinstall": "prisma generate"
   },
   "keywords": [],
   "author": "",
