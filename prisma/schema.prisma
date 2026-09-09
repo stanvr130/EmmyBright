@@ -63,6 +63,8 @@ model User {
   updatedAt     DateTime @updatedAt
   address       String?
   phone         String?
+  cartData     Json?
+  deliveryData Json?
   orders        Order[]
 }
 

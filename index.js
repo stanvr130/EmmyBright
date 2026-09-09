@@ -19,7 +19,7 @@ import productRoutes from './routes/productsRoutes.js';
 import authRoutes from './routes/authRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import orderRoutes from './routes/orderRoutes.js';
-import paymentRoutes from './routes/payment.js'; 
+import cartDeliveryRoutes from './routes/cartRoutes.js';
 import categoryRoutes from './routes/categoryRoutes.js';
 import errorHandler from './middleware/errorMiddleware.js';
 
@@ -39,9 +39,14 @@ app.use(helmet({
 }));
 
 // 🛡️ 2. CORS: Cross-Origin Resource Sharing
+// Local dev origins are always allowed. Production/staging origins come from
+// CLIENT_URL (and optional ADDITIONAL_ORIGINS, comma-separated) in .env —
+// so adding a real domain later is just an env var change, no code edit.
 const allowedOrigins = [
   'http://localhost:5173',
-  'http://127.0.0.1:5173'
+  'http://127.0.0.1:5173',
+  ...(process.env.CLIENT_URL ? [process.env.CLIENT_URL] : []),
+  ...(process.env.ADDITIONAL_ORIGINS ? process.env.ADDITIONAL_ORIGINS.split(',').map(o => o.trim()) : [])
 ];
 
 app.use(cors({
@@ -70,13 +75,9 @@ const apiLimiter = rateLimit({
 });
 
 app.use('/api/', apiLimiter);
-
-// 📦 Global Body & Cookie Parsing Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
-
-// ⚡ ANTI-CACHE MIDDLEWARE
 app.use('/api', (req, res, next) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
@@ -97,8 +98,8 @@ app.use('/api/products', productRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/orders', orderRoutes);
-app.use('/api/payments', paymentRoutes); 
 app.use('/api/categories', categoryRoutes);
+app.use('/api', cartDeliveryRoutes);
 
 // 🚨 Global Error Handler Middleware
 app.use(errorHandler);

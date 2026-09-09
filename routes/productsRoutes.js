@@ -77,8 +77,8 @@ const updateProductSchema = Joi.object({
 
 // Parse multipart/form-data fields (from Multer) into native types before Joi validation
 const parseFormDataFields = (req, res, next) => {
-  if (req.file) {
-    req.body.image = `/uploads/${req.file.filename}`;
+   if (req.file) {
+    req.body.image = req.file.path;
   }
   if (typeof req.body.price === 'string' && req.body.price !== '') {
     req.body.price = parseFloat(req.body.price);

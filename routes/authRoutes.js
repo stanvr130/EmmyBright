@@ -7,10 +7,6 @@ import { sendOtp, verifyOtp, forgotPassword, resetPassword } from '../src/contro
 
 const router = express.Router();
 
-console.log('--- AuthRoutes Debugging ---');
-console.log('Imported prisma value:', prisma);
-console.log('----------------------------');
-
 /**
  * @swagger
  * /api/auth/register:
@@ -166,8 +162,6 @@ router.post('/login', async (req, res) => {
       JWT_REFRESH_SECRET,
       { expiresIn: '7d' }
     );
-
-    // C. Set Refresh Token in httpOnly cookie
     res.cookie('refreshToken', refreshToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
@@ -271,7 +265,7 @@ router.post('/logout', (req, res) => {
   res.clearCookie('refreshToken', {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax'
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
   });
 
   return res.status(200).json({
