@@ -16,3 +16,4 @@ const prisma = new PrismaClient({ adapter });
 
 export { prisma };
 export default prisma;
+// postgresql://postgres.xewlgqqevmpzpjcvfaxr:zz4nnXzbQ-+bLQ8@aws-0-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require
