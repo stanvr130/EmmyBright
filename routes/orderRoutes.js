@@ -46,30 +46,55 @@ router.post('/webhook', express.text({ type: '*/*' }), async (req, res) => {
 
     console.log(`📡 Incoming Webhook Event Type Caught: ${event.event}`);
 
-    if (event.event === 'charge.success') {
-      const transactionData = event.data;
-      const orderId = transactionData.metadata?.orderId;
-      const reference = transactionData.reference;
+   if (event.event === 'charge.success') {
+  const transactionData = event.data;
+  const orderId = transactionData.metadata?.orderId;
+  const reference = transactionData.reference;
 
-      if (!orderId) {
-        console.warn(`⚠️ Paystack Webhook missing orderId in metadata (Ref: ${reference})`);
-        return;
-      }
+  if (!orderId) {
+    console.warn(`⚠️ Paystack Webhook missing orderId in metadata (Ref: ${reference})`);
+    return;
+  }
 
-      console.log(`⚡ Paystack Webhook: Payment verified for Order ID #${orderId} (Ref: ${reference})`);
+  const numericOrderId = parseInt(orderId, 10);
 
-      await prisma.order.update({
-        where: { id: parseInt(orderId, 10) },
-        data: { 
-          paymentStatus: 'PAID',
-          status: 'PROCESSING',
-          paymentReference: reference
-        }
+  const existingOrder = await prisma.order.findUnique({
+    where: { id: numericOrderId },
+    include: { orderItems: true }
+  });
+
+  if (!existingOrder) {
+    console.warn(`⚠️ Webhook: Order #${numericOrderId} not found (Ref: ${reference})`);
+    return;
+  }
+
+  // Idempotency guard — never decrement stock twice for the same order,
+  // in case both the webhook and /verify-payment fire for it.
+  if (existingOrder.paymentStatus === 'PAID') {
+    console.log(`ℹ️ Order #${numericOrderId} already marked PAID — skipping duplicate stock decrement.`);
+    return;
+  }
+
+  await prisma.$transaction(async (tx) => {
+    for (const orderItem of existingOrder.orderItems) {
+      await tx.variant.update({
+        where: { id: orderItem.variantId },
+        data: { stock: { decrement: orderItem.quantity } }
       });
-      
-      console.log(`✅ Order ID #${orderId} successfully marked as PAID via Webhook sync.`);
     }
 
+    await tx.order.update({
+      where: { id: numericOrderId },
+      data: {
+        paymentStatus: 'PAID',
+        status: 'PROCESSING',
+        paymentReference: reference
+      }
+    });
+  });
+
+  console.log(`✅ Order ID #${numericOrderId} marked PAID and stock decremented via Webhook sync.`);
+}
   } catch (error) {
     console.error('❌ Webhook Processing Error:', error.message);
   }
@@ -124,14 +149,29 @@ router.get('/verify-payment', async (req, res, next) => {
       }
 
       // Update Order in Prisma DB
-      const updatedOrder = await prisma.order.update({
-        where: { id: numericOrderId },
-        data: { 
-          paymentStatus: 'PAID',
-          status: 'PROCESSING',
-          paymentReference: reference
-        }
-      });
+     // Fetch order items so we know which variants to decrement
+const orderWithItems = await prisma.order.findUnique({
+  where: { id: numericOrderId },
+  include: { orderItems: true }
+});
+
+const updatedOrder = await prisma.$transaction(async (tx) => {
+  for (const orderItem of orderWithItems.orderItems) {
+    await tx.variant.update({
+      where: { id: orderItem.variantId },
+      data: { stock: { decrement: orderItem.quantity } }
+    });
+  }
+
+  return tx.order.update({
+    where: { id: numericOrderId },
+    data: {
+      paymentStatus: 'PAID',
+      status: 'PROCESSING',
+      paymentReference: reference
+    }
+  });
+});
 
       return res.status(200).json({
         success: true,
@@ -170,32 +210,25 @@ router.post('/', protect, validateBody(createOrderSchema), async (req, res, next
       let totalAmount = 0;
       const orderItemsToCreate = [];
 
-      for (const item of items) {
-        const variant = await tx.variant.findUniqueOrThrow({
-          where: { id: item.variantId },
-          include: { product: true }
-        });
+     for (const item of items) {
+  const variant = await tx.variant.findUniqueOrThrow({
+    where: { id: item.variantId },
+    include: { product: true }
+  });
 
-        if (variant.stock < item.quantity) {
-          throw new Error(`Insufficient stock for ${variant.product.name} (${variant.color || 'Default'} - Size ${variant.size || 'Default'}). Only ${variant.stock} left.`);
-        }
+  if (variant.stock < item.quantity) {
+    throw new Error(`Insufficient stock for ${variant.product.name} (${variant.color || 'Default'} - Size ${variant.size || 'Default'}). Only ${variant.stock} left.`);
+  }
 
-        await tx.variant.update({
-          where: { id: item.variantId },
-          data: {
-            stock: variant.stock - item.quantity
-          }
-        });
+  const itemPrice = variant.product.price;
+  totalAmount += itemPrice * item.quantity;
 
-        const itemPrice = variant.product.price;
-        totalAmount += itemPrice * item.quantity;
-
-        orderItemsToCreate.push({
-          variantId: item.variantId,
-          quantity: item.quantity,
-          price: itemPrice
-        });
-      }
+  orderItemsToCreate.push({
+    variantId: item.variantId,
+    quantity: item.quantity,
+    price: itemPrice
+  });
+}
 
       return await tx.order.create({
         data: {
