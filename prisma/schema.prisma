@@ -40,6 +40,7 @@ model Product {
   updatedAt   DateTime  @updatedAt
   image       String?
   variants    Variant[]
+  wishlistedBy Wishlist[]
 }
 
 model Variant {
@@ -66,6 +67,7 @@ model User {
   cartData     Json?
   deliveryData Json?
   orders        Order[]
+  wishlist  Wishlist[]
 }
 
 model Order {
@@ -105,4 +107,15 @@ model OtpCode {
   createdAt DateTime @default(now())
 
   @@index([email])
+}
+model Wishlist {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  productId Int
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, productId])
 }
