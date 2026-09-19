@@ -21,6 +21,7 @@ import userRoutes from './routes/userRoutes.js';
 import orderRoutes from './routes/orderRoutes.js';
 import cartDeliveryRoutes from './routes/cartRoutes.js';
 import categoryRoutes from './routes/categoryRoutes.js';
+import wishlistRoutes from './routes/wishlistRoutes.js';
 import errorHandler from './middleware/errorMiddleware.js';
 
 // Setup ES Module equivalents for __dirname
@@ -100,7 +101,7 @@ app.use('/api/users', userRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api', cartDeliveryRoutes);
-
+app.use('/api/wishlist', wishlistRoutes);
 // 🚨 Global Error Handler Middleware
 app.use(errorHandler);
 
