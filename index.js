@@ -23,6 +23,7 @@ import cartDeliveryRoutes from './routes/cartRoutes.js';
 import categoryRoutes from './routes/categoryRoutes.js';
 import wishlistRoutes from './routes/wishlistRoutes.js';
 import errorHandler from './middleware/errorMiddleware.js';
+import validateEmail from './middleware/validateEmail.js';
 
 // Setup ES Module equivalents for __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -31,6 +32,9 @@ const __dirname = path.dirname(__filename);
 const app = express();
 
 // 🛡️ Trust Proxy (Crucial for Rate Limiting behind Ngrok/Localtunnel proxies)
+// NOTE: when you deploy, "1" must match the number of proxies in front of
+// your app (e.g. 1 for most hosts). If it's wrong, every user can appear
+// to share one IP, or the limiter can be bypassed.
 app.set('trust proxy', 1);
 
 // 🛡️ 1. HELMET: Infrastructure Header Hardening
@@ -63,7 +67,9 @@ app.use(cors({
   credentials: true
 }));
 
-// 🛡️ 3. RATE LIMITER: Brute-Force & Denial-of-Service Defense
+// 🛡️ 3. RATE LIMITERS: Brute-Force & Denial-of-Service Defense
+
+// General limiter for the whole API
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, 
   max: 100,                 
@@ -75,10 +81,50 @@ const apiLimiter = rateLimit({
   }
 });
 
+// Strict limiter for routes that SEND EMAIL (protects your Resend quota and
+// domain reputation). Per IP, regardless of which email address is submitted.
+const emailSendLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: 'Too many verification requests from this network. Please wait 15 minutes and try again.',
+    message: 'Too many verification requests from this network. Please wait 15 minutes and try again.'
+  }
+});
+
+// Limiter for credential-guessing routes (login, OTP check, password reset)
+const credentialLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: 'Too many attempts from this network. Please wait 15 minutes and try again.',
+    message: 'Too many attempts from this network. Please wait 15 minutes and try again.'
+  }
+});
+
 app.use('/api/', apiLimiter);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
+
+// 📧 Email-sending routes: rate limit first, then validate the email format.
+// These must be registered BEFORE app.use('/api/auth', authRoutes) below.
+// If your register route is not /api/auth/register, change the path here.
+app.use('/api/auth/send-otp', emailSendLimiter, validateEmail);
+app.use('/api/auth/forgot-password', emailSendLimiter, validateEmail);
+app.use('/api/auth/register', emailSendLimiter, validateEmail);
+
+// 🔐 Credential-guessing routes
+app.use('/api/auth/login', credentialLimiter);
+app.use('/api/auth/verify-otp', credentialLimiter);
+app.use('/api/auth/reset-password', credentialLimiter);
+
 app.use('/api', (req, res, next) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
@@ -102,6 +148,7 @@ app.use('/api/orders', orderRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api', cartDeliveryRoutes);
 app.use('/api/wishlist', wishlistRoutes);
+
 // 🚨 Global Error Handler Middleware
 app.use(errorHandler);
 

@@ -1,11 +1,15 @@
 import { Resend } from 'resend';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import prisma from '../config/db.js';
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+// Verified domain sender. Override with MAIL_FROM in .env if you ever need to.
+const MAIL_FROM = process.env.MAIL_FROM || 'EmmyBright <noreply@emmybrightng.com.ng>';
+
 function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return crypto.randomInt(100000, 1000000).toString();
 }
 
 // Shared helper — creates + sends an OTP for a given purpose
@@ -37,12 +41,18 @@ async function createAndSendOtp(email, purpose, subject, bodyText) {
     data: { email, code, purpose, expiresAt },
   });
 
-  await resend.emails.send({
-    from: 'onboarding@resend.dev',
-    to: email,
+  // Resend returns { data, error } instead of throwing, so check it explicitly
+  const { error } = await resend.emails.send({
+    from: MAIL_FROM,
+    to: [email],
     subject,
     html: `<p>${bodyText} Your code is <strong>${code}</strong>. It expires in 10 minutes.</p>`,
   });
+
+  if (error) {
+    console.error('Resend error:', error);
+    throw new Error('email_send_failed');
+  }
 }
 
 // Shared helper — validates a code for a given purpose
@@ -68,7 +78,7 @@ async function checkOtp(email, code, purpose) {
   return { ok: true };
 }
 
-// POST /api/auth/send-otp  (registration/email verification — unchanged behavior)
+// POST /api/auth/send-otp  (registration/email verification)
 export async function sendOtp(req, res) {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email is required' });
@@ -88,7 +98,7 @@ export async function sendOtp(req, res) {
   }
 }
 
-// POST /api/auth/verify-otp  (unchanged behavior, now scoped to purpose: 'verify')
+// POST /api/auth/verify-otp  (scoped to purpose: 'verify')
 export async function verifyOtp(req, res) {
   const { email, code } = req.body;
   if (!email || !code) return res.status(400).json({ error: 'Email and code are required' });

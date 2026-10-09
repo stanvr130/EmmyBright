@@ -68,6 +68,7 @@ model User {
   deliveryData Json?
   orders        Order[]
   wishlist  Wishlist[]
+    isActive      Boolean  @default(true)
 }
 
 model Order {

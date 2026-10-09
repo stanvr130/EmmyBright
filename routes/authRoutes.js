@@ -7,6 +7,28 @@ import { sendOtp, verifyOtp, forgotPassword, resetPassword } from '../src/contro
 
 const router = express.Router();
 
+const isProd = process.env.NODE_ENV === 'production';
+
+// One shared cookie config so register, login, refresh and logout always agree
+const REFRESH_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: isProd,
+  sameSite: isProd ? 'none' : 'lax',
+};
+const REFRESH_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
+
+// Burns the same time as a real compare when the email doesn't exist,
+// so response timing doesn't reveal which emails are registered
+const DUMMY_HASH = bcrypt.hashSync('dummy-password-for-timing', 10);
+
+function signAccessToken(user) {
+  return jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '15m' });
+}
+
+function signRefreshToken(user) {
+  return jwt.sign({ id: user.id, role: user.role }, JWT_REFRESH_SECRET, { expiresIn: '7d' });
+}
+
 /**
  * @swagger
  * /api/auth/register:
@@ -42,8 +64,12 @@ router.post('/register', async (req, res) => {
   try {
     const { email, password, name } = req.body;
 
-    if (!email || !password) {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
       return res.status(400).json({ message: 'Email and password are required.' });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({ message: 'Password must be at least 8 characters.' });
     }
 
     const existingUser = await prisma.user.findUnique({ where: { email } });
@@ -54,40 +80,26 @@ router.post('/register', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    // 🔄 FIX: public signups must never grant admin access. This route is
+    // Public signups must never grant admin access. This route is
     // unauthenticated, so `role` is never taken from req.body either —
     // it's always hardcoded here, server-side, to the least-privileged value.
     const newUser = await prisma.user.create({
       data: {
         email,
         password: hashedPassword,
-        name,
+        name: typeof name === 'string' ? name.trim() : undefined,
         role: 'USER'
       }
     });
 
     const { password: _, ...userWithoutPassword } = newUser;
 
-    // A. Issue short-lived Access Token (15 minutes)
-    const accessToken = jwt.sign(
-      { id: newUser.id, role: newUser.role },
-      JWT_SECRET,
-      { expiresIn: '15m' }
-    );
+    const accessToken = signAccessToken(newUser);
+    const refreshToken = signRefreshToken(newUser);
 
-    // B. Issue long-lived Refresh Token (7 days)
-    const refreshToken = jwt.sign(
-      { id: newUser.id, role: newUser.role },
-      JWT_REFRESH_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    // C. Store Refresh Token inside httpOnly cookie
     res.cookie('refreshToken', refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days in ms
+      ...REFRESH_COOKIE_OPTIONS,
+      maxAge: REFRESH_MAX_AGE
     });
 
     return res.status(201).json({
@@ -98,6 +110,10 @@ router.post('/register', async (req, res) => {
       user: userWithoutPassword
     });
   } catch (error) {
+    // Two signups with the same email at the same moment: the unique index wins
+    if (error?.code === 'P2002') {
+      return res.status(400).json({ message: 'An account with this email already exists.' });
+    }
     console.error('Registration error:', error);
     return res.status(500).json({ message: 'Failed to create account.' });
   }
@@ -128,6 +144,8 @@ router.post('/register', async (req, res) => {
  *         description: Login successful. Access token returned in body, Refresh token in httpOnly cookie.
  *       401:
  *         description: Invalid credentials
+ *       403:
+ *         description: Account suspended
  *       500:
  *         description: Server authentication error
  */
@@ -135,38 +153,31 @@ router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    if (!email || !password) {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
       return res.status(400).json({ message: 'Please provide both email and password.' });
     }
 
     const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) {
+
+    // Always run a compare, even for unknown emails, to keep timing uniform
+    const isMatch = await bcrypt.compare(password, user?.password || DUMMY_HASH);
+
+    if (!user || !isMatch) {
       return res.status(401).json({ message: 'Invalid credentials.' });
     }
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Invalid credentials.' });
+    // Suspended accounts (only reached with the correct password).
+    // `=== false` keeps this harmless until the isActive column exists.
+    if (user.isActive === false) {
+      return res.status(403).json({ message: 'This account has been suspended. Please contact support.' });
     }
 
-    // A. Issue short-lived Access Token (15 minutes)
-    const accessToken = jwt.sign(
-      { id: user.id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '15m' }
-    );
+    const accessToken = signAccessToken(user);
+    const refreshToken = signRefreshToken(user);
 
-    // B. Issue long-lived Refresh Token (7 days)
-    const refreshToken = jwt.sign(
-      { id: user.id, role: user.role },
-      JWT_REFRESH_SECRET,
-      { expiresIn: '7d' }
-    );
     res.cookie('refreshToken', refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days in ms
+      ...REFRESH_COOKIE_OPTIONS,
+      maxAge: REFRESH_MAX_AGE
     });
 
     return res.status(200).json({
@@ -198,7 +209,7 @@ router.post('/login', async (req, res) => {
  *       200:
  *         description: Returns new short-lived access token
  *       401:
- *         description: Missing or unreadable refresh token cookie
+ *         description: Missing refresh token cookie, or account no longer available
  *       403:
  *         description: Invalid or expired refresh token
  */
@@ -213,37 +224,33 @@ router.post('/refresh', async (req, res) => {
       });
     }
 
-    jwt.verify(refreshToken, JWT_REFRESH_SECRET, async (err, decoded) => {
-      if (err) {
-        return res.status(403).json({
-          success: false,
-          message: 'Invalid or expired refresh token.'
-        });
-      }
-
-      const user = await prisma.user.findUnique({
-        where: { id: decoded.id },
-        select: { id: true, role: true }
+    let decoded;
+    try {
+      decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+    } catch {
+      return res.status(403).json({
+        success: false,
+        message: 'Invalid or expired refresh token.'
       });
+    }
 
-      if (!user) {
-        return res.status(401).json({
-          success: false,
-          message: 'User account no longer exists.'
-        });
-      }
+    const user = await prisma.user.findUnique({ where: { id: decoded.id } });
 
-      const newAccessToken = jwt.sign(
-        { id: user.id, role: user.role },
-        JWT_SECRET,
-        { expiresIn: '15m' }
-      );
-
-      return res.status(200).json({
-        success: true,
-        accessToken: newAccessToken,
-        token: newAccessToken // Backward compatibility alias
+    // Deleted or suspended accounts can't keep refreshing
+    if (!user || user.isActive === false) {
+      res.clearCookie('refreshToken', REFRESH_COOKIE_OPTIONS);
+      return res.status(401).json({
+        success: false,
+        message: 'User account no longer available.'
       });
+    }
+
+    const newAccessToken = signAccessToken(user);
+
+    return res.status(200).json({
+      success: true,
+      accessToken: newAccessToken,
+      token: newAccessToken // Backward compatibility alias
     });
   } catch (error) {
     console.error('Token refresh error:', error);
@@ -262,11 +269,7 @@ router.post('/refresh', async (req, res) => {
  *         description: Refresh token cookie cleared successfully
  */
 router.post('/logout', (req, res) => {
-  res.clearCookie('refreshToken', {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
-  });
+  res.clearCookie('refreshToken', REFRESH_COOKIE_OPTIONS);
 
   return res.status(200).json({
     success: true,
