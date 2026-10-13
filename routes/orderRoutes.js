@@ -1,12 +1,104 @@
 import express from 'express';
-import crypto from 'crypto'; 
 import { protect, protectAdmin } from '../middleware/authMiddleware.js';
 import { validateBody } from '../middleware/validateMiddleware.js'; 
 import { createOrderSchema } from '../validators/orderValidator.js'; 
 import prisma from '../src/config/db.js';
-import { initializePaystackPayment, verifyPaystackPayment } from '../services/paystackService.js'; 
+import {
+  initializePaystackPayment,
+  verifyPaystackPayment,
+  checkPaymentMatchesOrder,
+  isValidPaystackSignature,
+} from '../services/paystackService.js'; 
 
 const router = express.Router();
+
+// Delivery fee is decided on the server, never taken from the request body
+const FLAT_DELIVERY_FEE = Number(process.env.DELIVERY_FEE) || 3000;
+
+// Only the fields the payment-return page needs (no address/phone/user id)
+function toPublicOrder(order) {
+  return {
+    id: order.id,
+    totalAmount: order.totalAmount,
+    deliveryFee: order.deliveryFee,
+    status: order.status,
+    paymentStatus: order.paymentStatus,
+    paymentReference: order.paymentReference,
+    createdAt: order.createdAt,
+  };
+}
+
+/**
+ * Shared by the webhook and /verify-payment.
+ * Takes VERIFIED transaction data from Paystack, finds the matching order,
+ * checks reference/amount/currency, then marks it PAID exactly once.
+ */
+async function settlePaidOrder(transactionData) {
+  const reference = transactionData?.reference;
+  if (!reference) {
+    return { ok: false, status: 400, error: 'Transaction reference is missing.' };
+  }
+
+  // 1. Find the order by the reference we saved at checkout
+  let order = await prisma.order.findUnique({ where: { paymentReference: reference } });
+
+  // 2. Fallback for orders created before references were saved:
+  //    use metadata.orderId, but only for orders with no reference yet.
+  if (!order) {
+    const metaId = parseInt(transactionData.metadata?.orderId, 10);
+    if (Number.isInteger(metaId)) {
+      const candidate = await prisma.order.findUnique({ where: { id: metaId } });
+      if (candidate && candidate.paymentReference === null) order = candidate;
+    }
+  }
+
+  if (!order) {
+    return { ok: false, status: 404, error: 'No order matches this payment.' };
+  }
+
+  // 3. Status, reference, currency and exact amount must all match this order
+  const check = checkPaymentMatchesOrder(transactionData, {
+    reference,
+    amountInNaira: order.totalAmount + order.deliveryFee,
+  });
+  if (!check.ok) {
+    return { ok: false, status: 400, error: check.reason, order };
+  }
+
+  if (order.paymentStatus === 'PAID') {
+    return { ok: true, order, alreadyPaid: true };
+  }
+
+  // 4. Claim the order atomically. If the webhook and the verify route fire at
+  //    the same moment, only one of them gets count === 1 and subtracts stock.
+  const outcome = await prisma.$transaction(async (tx) => {
+    const claimed = await tx.order.updateMany({
+      where: { id: order.id, paymentStatus: { not: 'PAID' } },
+      data: { paymentStatus: 'PAID', status: 'PROCESSING', paymentReference: reference },
+    });
+
+    if (claimed.count === 0) return { alreadyPaid: true };
+
+    const items = await tx.orderItem.findMany({ where: { orderId: order.id } });
+    for (const item of items) {
+      const variant = await tx.variant.update({
+        where: { id: item.variantId },
+        data: { stock: { decrement: item.quantity } },
+        select: { id: true, stock: true },
+      });
+      if (variant.stock < 0) {
+        console.warn(
+          `⚠️ OVERSOLD: variant #${variant.id} stock is ${variant.stock} after order #${order.id}. Needs manual follow-up or refund.`
+        );
+      }
+    }
+
+    return { alreadyPaid: false };
+  });
+
+  const freshOrder = await prisma.order.findUnique({ where: { id: order.id } });
+  return { ok: true, order: freshOrder, alreadyPaid: outcome.alreadyPaid };
+}
 
 // ==========================================
 // 1. PUBLIC WEBHOOKS & CALLBACKS (NO AUTH REQUIRED)
@@ -15,99 +107,49 @@ const router = express.Router();
 // @route   POST /api/orders/webhook
 // @desc    Secure webhook receiver to catch payment updates straight from Paystack
 // @access  Public (Cryptographically verified)
-router.post('/webhook', express.text({ type: '*/*' }), async (req, res) => {
+// Needs req.rawBody, which the server file captures for this exact path.
+router.post('/webhook', async (req, res) => {
   try {
-    const secret = process.env.PAYSTACK_SECRET_KEY;
-    let rawPayload = req.body;
+    const signature = req.headers['x-paystack-signature'];
 
-    if (typeof rawPayload === 'object') {
-      rawPayload = JSON.stringify(req.body);
-    }
-
-    if (!rawPayload) {
-      console.warn('⚠️ Webhook received an empty body stream.');
-      return res.status(400).send('Empty body');
-    }
-    
-    const hash = crypto
-      .createHmac('sha512', secret)
-      .update(rawPayload) 
-      .digest('hex');
-
-    if (hash !== req.headers['x-paystack-signature']) {
-      console.warn('⚠️ Unauthorized webhook signature detected!');
+    if (!req.rawBody || !isValidPaystackSignature(req.rawBody, signature)) {
+      console.warn('⚠️ Unauthorized or malformed webhook rejected.');
       return res.status(401).send('Invalid signature');
     }
 
-    // Acknowledge Paystack receipt immediately
-    res.status(200).send('Webhook received');
+    const event = req.body;
+    console.log(`📡 Incoming Webhook Event Type Caught: ${event?.event}`);
 
-    const event = typeof req.body === 'object' ? req.body : JSON.parse(rawPayload);
+    if (event?.event === 'charge.success') {
+      const result = await settlePaidOrder(event.data);
 
-    console.log(`📡 Incoming Webhook Event Type Caught: ${event.event}`);
-
-   if (event.event === 'charge.success') {
-  const transactionData = event.data;
-  const orderId = transactionData.metadata?.orderId;
-  const reference = transactionData.reference;
-
-  if (!orderId) {
-    console.warn(`⚠️ Paystack Webhook missing orderId in metadata (Ref: ${reference})`);
-    return;
-  }
-
-  const numericOrderId = parseInt(orderId, 10);
-
-  const existingOrder = await prisma.order.findUnique({
-    where: { id: numericOrderId },
-    include: { orderItems: true }
-  });
-
-  if (!existingOrder) {
-    console.warn(`⚠️ Webhook: Order #${numericOrderId} not found (Ref: ${reference})`);
-    return;
-  }
-
-  // Idempotency guard — never decrement stock twice for the same order,
-  // in case both the webhook and /verify-payment fire for it.
-  if (existingOrder.paymentStatus === 'PAID') {
-    console.log(`ℹ️ Order #${numericOrderId} already marked PAID — skipping duplicate stock decrement.`);
-    return;
-  }
-
-  await prisma.$transaction(async (tx) => {
-    for (const orderItem of existingOrder.orderItems) {
-      await tx.variant.update({
-        where: { id: orderItem.variantId },
-        data: { stock: { decrement: orderItem.quantity } }
-      });
+      if (!result.ok) {
+        // Acknowledge anyway so Paystack doesn't retry forever, but log loudly
+        console.warn(`⚠️ Webhook could not settle payment (Ref: ${event.data?.reference}): ${result.error}`);
+      } else if (result.alreadyPaid) {
+        console.log(`ℹ️ Order #${result.order.id} already PAID — no duplicate stock change.`);
+      } else {
+        console.log(`✅ Order ID #${result.order.id} marked PAID and stock decremented via Webhook sync.`);
+      }
     }
 
-    await tx.order.update({
-      where: { id: numericOrderId },
-      data: {
-        paymentStatus: 'PAID',
-        status: 'PROCESSING',
-        paymentReference: reference
-      }
-    });
-  });
-
-  console.log(`✅ Order ID #${numericOrderId} marked PAID and stock decremented via Webhook sync.`);
-}
+    return res.status(200).send('Webhook received');
   } catch (error) {
     console.error('❌ Webhook Processing Error:', error.message);
+    // 500 tells Paystack to retry later
+    return res.status(500).send('Webhook processing failed');
   }
 });
 
 // @route   GET /api/orders/verify-payment
 // @desc    Verify Paystack transaction status and return JSON payload to React SPA
-// @access  Public (Redirect callback)
-router.get('/verify-payment', async (req, res, next) => {
+// @access  Public (Redirect callback). Safe because it only settles a payment
+//          that Paystack confirms for a reference saved on an order, for the exact amount.
+router.get('/verify-payment', async (req, res) => {
   try {
     const { reference } = req.query; 
 
-    if (!reference) {
+    if (typeof reference !== 'string' || !reference) {
       return res.status(400).json({ 
         success: false, 
         error: 'Transaction reference is missing.' 
@@ -116,75 +158,27 @@ router.get('/verify-payment', async (req, res, next) => {
 
     const transactionData = await verifyPaystackPayment(reference);
 
-    if (transactionData && transactionData.status === 'success') {
-      const orderId = transactionData.metadata?.orderId || reference.split('_')[1];
-
-      if (!orderId) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'Order metadata not found on payment verification.' 
-        });
-      }
-
-      const numericOrderId = parseInt(orderId, 10);
-
-      const existingOrder = await prisma.order.findUnique({
-        where: { id: numericOrderId }
-      });
-
-      if (!existingOrder) {
-        return res.status(404).json({
-          success: false,
-          error: `Associated Order #${numericOrderId} could not be found.`
-        });
-      }
-
-      // Idempotency: Return success if already marked as PAID (e.g. via Webhook)
-      if (existingOrder.paymentStatus === 'PAID') {
-        return res.status(200).json({
-          success: true,
-          message: 'Payment verified successfully (already synced).',
-          order: existingOrder
-        });
-      }
-
-      // Update Order in Prisma DB
-     // Fetch order items so we know which variants to decrement
-const orderWithItems = await prisma.order.findUnique({
-  where: { id: numericOrderId },
-  include: { orderItems: true }
-});
-
-const updatedOrder = await prisma.$transaction(async (tx) => {
-  for (const orderItem of orderWithItems.orderItems) {
-    await tx.variant.update({
-      where: { id: orderItem.variantId },
-      data: { stock: { decrement: orderItem.quantity } }
-    });
-  }
-
-  return tx.order.update({
-    where: { id: numericOrderId },
-    data: {
-      paymentStatus: 'PAID',
-      status: 'PROCESSING',
-      paymentReference: reference
-    }
-  });
-});
-
-      return res.status(200).json({
-        success: true,
-        message: 'Payment verified and order updated successfully.',
-        order: updatedOrder
-      });
-
-    } else {
+    if (transactionData?.status !== 'success') {
       return res.status(400).json({
         success: false,
         error: `Gateway verification failed: ${transactionData?.gateway_response || 'Declined'}`
       });
     }
+
+    const result = await settlePaidOrder(transactionData);
+
+    if (!result.ok) {
+      console.warn(`⚠️ Verify route rejected payment (Ref: ${reference}): ${result.error}`);
+      return res.status(result.status).json({ success: false, error: result.error });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: result.alreadyPaid
+        ? 'Payment verified successfully (already synced).'
+        : 'Payment verified and order updated successfully.',
+      order: toPublicOrder(result.order)
+    });
 
   } catch (error) {
     console.error('❌ Verification Route Failure:', error.message);
@@ -200,41 +194,52 @@ const updatedOrder = await prisma.$transaction(async (tx) => {
 // ==========================================
 
 // @route   POST /api/orders
-// @desc    Create a new order, calculate totals, decrement variant stock, and initialize Paystack checkout link
+// @desc    Create a new order, calculate totals, and initialize Paystack checkout link
+//          (stock is decremented when payment is confirmed, not here)
 // @access  Private (Customer/Admin)
 router.post('/', protect, validateBody(createOrderSchema), async (req, res, next) => {
   try {
-    const { items, shippingAddress, phone, deliveryFee = 3000 } = req.body; 
+    const { items, shippingAddress, phone } = req.body; 
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, error: 'Your order has no items.' });
+    }
+
+    for (const item of items) {
+      if (!Number.isInteger(item.variantId) || !Number.isInteger(item.quantity) || item.quantity <= 0) {
+        return res.status(400).json({ success: false, error: 'Each item needs a valid variant and a positive whole quantity.' });
+      }
+    }
 
     const newOrder = await prisma.$transaction(async (tx) => {
       let totalAmount = 0;
       const orderItemsToCreate = [];
 
-     for (const item of items) {
-  const variant = await tx.variant.findUniqueOrThrow({
-    where: { id: item.variantId },
-    include: { product: true }
-  });
+      for (const item of items) {
+        const variant = await tx.variant.findUniqueOrThrow({
+          where: { id: item.variantId },
+          include: { product: true }
+        });
 
-  if (variant.stock < item.quantity) {
-    throw new Error(`Insufficient stock for ${variant.product.name} (${variant.color || 'Default'} - Size ${variant.size || 'Default'}). Only ${variant.stock} left.`);
-  }
+        if (variant.stock < item.quantity) {
+          throw new Error(`Insufficient stock for ${variant.product.name} (${variant.color || 'Default'} - Size ${variant.size || 'Default'}). Only ${variant.stock} left.`);
+        }
 
-  const itemPrice = variant.product.price;
-  totalAmount += itemPrice * item.quantity;
+        const itemPrice = variant.product.price;
+        totalAmount += itemPrice * item.quantity;
 
-  orderItemsToCreate.push({
-    variantId: item.variantId,
-    quantity: item.quantity,
-    price: itemPrice
-  });
-}
+        orderItemsToCreate.push({
+          variantId: item.variantId,
+          quantity: item.quantity,
+          price: itemPrice
+        });
+      }
 
       return await tx.order.create({
         data: {
           userId: req.user.id,
           totalAmount,
-          deliveryFee: parseFloat(deliveryFee),
+          deliveryFee: FLAT_DELIVERY_FEE,
           shippingAddress,
           phone, 
           orderItems: {
@@ -268,17 +273,26 @@ router.post('/', protect, validateBody(createOrderSchema), async (req, res, next
       newOrder.id
     );
 
+    // Save the reference on the order so payments can only settle THIS order
+    await prisma.order.update({
+      where: { id: newOrder.id },
+      data: { paymentReference: paymentData.reference }
+    });
+
     return res.status(201).json({
       success: true,
       message: 'Order created and payment initialized successfully.',
       paymentUrl: paymentData.authorization_url, 
       reference: paymentData.reference,
-      order: newOrder
+      order: { ...newOrder, paymentReference: paymentData.reference }
     });
 
   } catch (error) {
     if (error.message && error.message.includes('Insufficient stock')) {
       return res.status(400).json({ success: false, error: error.message });
+    }
+    if (error.code === 'P2025') {
+      return res.status(400).json({ success: false, error: 'One of the items in your cart is no longer available.' });
     }
     next(error);
   }

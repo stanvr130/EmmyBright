@@ -31,6 +31,9 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 
+const PAYSTACK_WEBHOOK_PATH = '/api/orders/webhook';
+const isWebhookRequest = (req) => req.originalUrl.split('?')[0] === PAYSTACK_WEBHOOK_PATH;
+
 // 🛡️ Trust Proxy (Crucial for Rate Limiting behind Ngrok/Localtunnel proxies)
 // NOTE: when you deploy, "1" must match the number of proxies in front of
 // your app (e.g. 1 for most hosts). If it's wrong, every user can appear
@@ -69,12 +72,14 @@ app.use(cors({
 
 // 🛡️ 3. RATE LIMITERS: Brute-Force & Denial-of-Service Defense
 
-// General limiter for the whole API
+// General limiter for the whole API (Paystack webhooks are exempt: they are
+// signature-verified and come from a few shared IPs)
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, 
   max: 100,                 
   standardHeaders: 'draft-7', 
   legacyHeaders: false,     
+  skip: isWebhookRequest,
   message: {
     success: false,
     message: 'Too many requests from this IP address. Please wait 15 minutes before trying again.'
@@ -109,13 +114,21 @@ const credentialLimiter = rateLimit({
 });
 
 app.use('/api/', apiLimiter);
-app.use(express.json());
+
+// Parse JSON, but keep the exact raw bytes of the Paystack webhook so its
+// signature can be verified against what Paystack actually sent
+app.use(express.json({
+  verify: (req, res, buf) => {
+    if (isWebhookRequest(req)) {
+      req.rawBody = buf;
+    }
+  }
+}));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 // 📧 Email-sending routes: rate limit first, then validate the email format.
 // These must be registered BEFORE app.use('/api/auth', authRoutes) below.
-// If your register route is not /api/auth/register, change the path here.
 app.use('/api/auth/send-otp', emailSendLimiter, validateEmail);
 app.use('/api/auth/forgot-password', emailSendLimiter, validateEmail);
 app.use('/api/auth/register', emailSendLimiter, validateEmail);
