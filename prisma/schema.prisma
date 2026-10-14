@@ -56,19 +56,20 @@ model Variant {
 model User {
   id            Int      @id @default(autoincrement())
   email         String   @unique
-  password      String
+  password      String?                      // changed: optional for Google sign-ups
+  googleId      String?  @unique             // new: Google's stable user id
   name          String?
   role          String   @default("USER")
   emailVerified Boolean  @default(false)
+  isActive      Boolean  @default(true)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
   address       String?
   phone         String?
-  cartData     Json?
-  deliveryData Json?
+  cartData      Json?
+  deliveryData  Json?
   orders        Order[]
-  wishlist  Wishlist[]
-    isActive      Boolean  @default(true)
+  wishlist      Wishlist[]
 }
 
 model Order {

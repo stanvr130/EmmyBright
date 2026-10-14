@@ -1,6 +1,7 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { OAuth2Client } from 'google-auth-library';
 import { JWT_SECRET, JWT_REFRESH_SECRET } from '../src/config/env.js';
 import prisma from '../src/config/db.js';
 import { sendOtp, verifyOtp, forgotPassword, resetPassword } from '../src/controllers/otpController.js';
@@ -8,6 +9,7 @@ import { sendOtp, verifyOtp, forgotPassword, resetPassword } from '../src/contro
 const router = express.Router();
 
 const isProd = process.env.NODE_ENV === 'production';
+const googleClient = new OAuth2Client();
 
 // One shared cookie config so register, login, refresh and logout always agree
 const REFRESH_COOKIE_OPTIONS = {
@@ -159,10 +161,11 @@ router.post('/login', async (req, res) => {
 
     const user = await prisma.user.findUnique({ where: { email } });
 
-    // Always run a compare, even for unknown emails, to keep timing uniform
+    // Always run a compare, even for unknown emails (or Google-only accounts
+    // with no password), to keep timing uniform
     const isMatch = await bcrypt.compare(password, user?.password || DUMMY_HASH);
 
-    if (!user || !isMatch) {
+    if (!user || !user.password || !isMatch) {
       return res.status(401).json({ message: 'Invalid credentials.' });
     }
 
@@ -196,6 +199,146 @@ router.post('/login', async (req, res) => {
   } catch (error) {
     console.error('Login error:', error);
     return res.status(500).json({ message: 'Server authentication failed.' });
+  }
+});
+
+/**
+ * @swagger
+ * /api/auth/google:
+ *   post:
+ *     summary: Sign in or register with a Google ID token
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [credential]
+ *             properties:
+ *               credential:
+ *                 type: string
+ *                 description: The ID token returned by Google Identity Services
+ *     responses:
+ *       200:
+ *         description: Signed in. Access token in body, Refresh token in httpOnly cookie.
+ *       400:
+ *         description: Missing credential
+ *       401:
+ *         description: Invalid Google token or unverified Google email
+ *       403:
+ *         description: Account suspended
+ *       500:
+ *         description: Server error
+ */
+router.post('/google', async (req, res) => {
+  try {
+    const { credential } = req.body;
+    const googleClientId = process.env.GOOGLE_CLIENT_ID;
+
+    if (typeof credential !== 'string' || !credential) {
+      return res.status(400).json({ message: 'Google credential is required.' });
+    }
+
+    if (!googleClientId) {
+      console.error('GOOGLE_CLIENT_ID is not set on the server.');
+      return res.status(500).json({ message: 'Google sign-in is not configured.' });
+    }
+
+    // 1. Verify the token with Google. The audience check makes sure it was
+    //    issued for YOUR app and not for some other site.
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: googleClientId,
+      });
+      payload = ticket.getPayload();
+    } catch {
+      return res.status(401).json({ message: 'Google sign-in could not be verified.' });
+    }
+
+    if (!payload?.sub || !payload.email || payload.email_verified !== true) {
+      return res.status(401).json({ message: 'Your Google email address is not verified.' });
+    }
+
+    const googleId = payload.sub;
+    const email = payload.email;
+    const googleName = typeof payload.name === 'string' ? payload.name.trim() : undefined;
+
+    // 2. Find the user: by Google id first, then by email (any capitalization)
+    let user = await prisma.user.findUnique({ where: { googleId } });
+    let isNewUser = false;
+
+    if (!user) {
+      const existing = await prisma.user.findFirst({
+        where: { email: { equals: email, mode: 'insensitive' } }
+      });
+
+      if (existing) {
+        // 3a. Link Google to the existing account. Google has proven the
+        //     email belongs to this person. If the old account was never
+        //     verified, remove its password so whoever created it with an
+        //     email they don't own can't keep using it.
+        user = await prisma.user.update({
+          where: { id: existing.id },
+          data: {
+            googleId,
+            emailVerified: true,
+            name: existing.name || googleName,
+            ...(existing.emailVerified ? {} : { password: null }),
+          }
+        });
+      } else {
+        // 3b. Brand new customer, already verified by Google. Never takes a
+        //     role from the request: always the least-privileged one.
+        user = await prisma.user.create({
+          data: {
+            email,
+            googleId,
+            name: googleName,
+            role: 'USER',
+            emailVerified: true,
+          }
+        });
+        isNewUser = true;
+      }
+    }
+
+    if (user.isActive === false) {
+      return res.status(403).json({ message: 'This account has been suspended. Please contact support.' });
+    }
+
+    // 4. Same tokens and cookie as the normal login
+    const accessToken = signAccessToken(user);
+    const refreshToken = signRefreshToken(user);
+
+    res.cookie('refreshToken', refreshToken, {
+      ...REFRESH_COOKIE_OPTIONS,
+      maxAge: REFRESH_MAX_AGE
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: isNewUser ? 'Account created with Google.' : 'Signed in with Google.',
+      isNewUser,
+      accessToken: accessToken,
+      token: accessToken, // Backward compatibility alias
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        emailVerified: user.emailVerified
+      }
+    });
+  } catch (error) {
+    // Two requests for the same new user at the same moment: ask to retry
+    if (error?.code === 'P2002') {
+      return res.status(409).json({ message: 'Please try signing in again.' });
+    }
+    console.error('Google sign-in error:', error);
+    return res.status(500).json({ message: 'Google sign-in failed.' });
   }
 });
 
